@@ -56,31 +56,36 @@ class Z407Manager(
     private enum class ConnectionStep {
         IDLE, PRE_SEQUENCE_CLEANUP,
         // PHASE 1: Profile cleanup
-        DISCONNECT_ALL_PROFILES,    // Disconnect ALL Bluetooth profiles (A2DP, HFP, AVRCP, etc.)
-        EXTENDED_WAIT_AFTER_DISCONNECT, // Wait longer after profile disconnect
+        DISCONNECT_ALL_PROFILES,
+        EXTENDED_WAIT_AFTER_DISCONNECT,
         
-        // PHASE 2: Standard attempts  
+        // PHASE 2: Standard attempts with MTU negotiation
+        DIRECT_CONNECT_BREDR,       // Try BR/EDR explicitly first (Z407 is hybrid)
+        MTU_NEGOTIATE_CONNECT,      // Request MTU before discovery
         DIRECT_CONNECT_AUTO,
-        GATT_BOUNCE_AGGRESSIVE,     // More aggressive bounce cycles
+        GATT_BOUNCE_AGGRESSIVE,
         DIRECT_CONNECT_LE,
         
-        // PHASE 3: Extended discovery
-        EXTENDED_WAIT_DISCOVERY,    // Connect and wait MUCH longer before discovery
+        // PHASE 3: Classic Bluetooth probe
+        CLASSIC_SOCKET_PROBE,       // Try RFCOMM socket to "wake up" GATT
+        
+        // PHASE 4: Extended discovery
+        EXTENDED_WAIT_DISCOVERY,
         AGGRESSIVE_DISCOVERY,
         
-        // PHASE 4: Scan-based approaches
+        // PHASE 5: Scan-based approaches
         SCAN_AND_CONNECT,
         REFRESH_CACHE,
         BACKGROUND_CONNECT,
         
-        // PHASE 5: Bonding operations  
-        FORCE_REBOND,               // Remove bond and create new one
-        WAIT_FOR_REBOND,            // Wait for bond to complete
-        POST_REBOND_CONNECT,        // Connect after rebond
+        // PHASE 6: Bonding operations  
+        FORCE_REBOND,
+        WAIT_FOR_REBOND,
+        POST_REBOND_CONNECT,
         
-        // PHASE 6: Last resort
+        // PHASE 7: Last resort
         BLIND_WRITE_ATTEMPT,
-        NUCLEAR_BLUETOOTH_RESET,    // Turn Bluetooth OFF then ON
+        NUCLEAR_BLUETOOTH_RESET,
         FINAL_DIRECT_CONNECT,
         
         CONNECTED, FAILED
@@ -92,7 +97,11 @@ class Z407Manager(
     @Volatile private var aggressiveDiscoveryAttempt = 0
     @Volatile private var rebondAttempted = false
     @Volatile private var nuclearResetAttempted = false
-    @Volatile private var savedTargetAddress: String? = null // Save MAC before unpair
+    @Volatile private var savedTargetAddress: String? = null
+    @Volatile private var classicSocketProbed = false
+    
+    // Track ALL open GATT connections for aggressive cleanup
+    private val openGattConnections = mutableListOf<BluetoothGatt>() // Save MAC before unpair
 
     private val handler = Handler(Looper.getMainLooper())
     private val logEntries = mutableListOf<String>()
@@ -161,6 +170,37 @@ class Z407Manager(
             log(Log.WARN, "GATT cache refresh failed to invoke: ${e.message}")
             false
         }
+    }
+    
+    /**
+     * Track a GATT connection for later cleanup
+     */
+    private fun trackGatt(gatt: BluetoothGatt) {
+        synchronized(openGattConnections) {
+            if (!openGattConnections.contains(gatt)) {
+                openGattConnections.add(gatt)
+            }
+        }
+    }
+    
+    /**
+     * AGGRESSIVE CLEANUP: Close ALL tracked GATT connections
+     * This prevents "ghost" callbacks from interfering with new strategies
+     */
+    private fun closeAllGattConnections() {
+        synchronized(openGattConnections) {
+            log(Log.INFO, "Closing ${openGattConnections.size} tracked GATT connections...")
+            openGattConnections.forEach { gatt ->
+                try {
+                    gatt.disconnect()
+                    gatt.close()
+                } catch (e: Exception) {
+                    // Ignore errors during cleanup
+                }
+            }
+            openGattConnections.clear()
+        }
+        bluetoothGatt = null
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -359,7 +399,11 @@ class Z407Manager(
         if (currentStep == ConnectionStep.FAILED) return
         
         watchdogHandler.removeCallbacksAndMessages(null)
+        handler.removeCallbacksAndMessages(null) // Also clear pending handler tasks
         if (isScanning) stopScan()
+        
+        // CRITICAL: Close ALL previous GATT connections before trying new strategy
+        closeAllGattConnections()
 
         val stepToAdvanceFrom = currentStep
         log(Log.INFO, "Advancing from step: $stepToAdvanceFrom (shouldTryBlindWrite=$shouldTryBlindWrite, bounceCount=$gattBounceCount, rebondAttempted=$rebondAttempted)")
@@ -368,28 +412,32 @@ class Z407Manager(
             // PHASE 1: Profile cleanup
             ConnectionStep.IDLE, ConnectionStep.PRE_SEQUENCE_CLEANUP -> ConnectionStep.DISCONNECT_ALL_PROFILES
             ConnectionStep.DISCONNECT_ALL_PROFILES -> ConnectionStep.EXTENDED_WAIT_AFTER_DISCONNECT
-            ConnectionStep.EXTENDED_WAIT_AFTER_DISCONNECT -> ConnectionStep.DIRECT_CONNECT_AUTO
+            ConnectionStep.EXTENDED_WAIT_AFTER_DISCONNECT -> ConnectionStep.DIRECT_CONNECT_BREDR
             
-            // PHASE 2: Standard attempts
+            // PHASE 2: Connection attempts with different transports
+            ConnectionStep.DIRECT_CONNECT_BREDR -> ConnectionStep.MTU_NEGOTIATE_CONNECT
+            ConnectionStep.MTU_NEGOTIATE_CONNECT -> ConnectionStep.DIRECT_CONNECT_AUTO
             ConnectionStep.DIRECT_CONNECT_AUTO -> ConnectionStep.GATT_BOUNCE_AGGRESSIVE
             ConnectionStep.GATT_BOUNCE_AGGRESSIVE -> ConnectionStep.DIRECT_CONNECT_LE
-            ConnectionStep.DIRECT_CONNECT_LE -> ConnectionStep.EXTENDED_WAIT_DISCOVERY
+            ConnectionStep.DIRECT_CONNECT_LE -> ConnectionStep.CLASSIC_SOCKET_PROBE
             
-            // PHASE 3: Extended discovery
+            // PHASE 3: Classic socket probe
+            ConnectionStep.CLASSIC_SOCKET_PROBE -> ConnectionStep.EXTENDED_WAIT_DISCOVERY
+            
+            // PHASE 4: Extended discovery
             ConnectionStep.EXTENDED_WAIT_DISCOVERY -> ConnectionStep.AGGRESSIVE_DISCOVERY
             ConnectionStep.AGGRESSIVE_DISCOVERY -> ConnectionStep.SCAN_AND_CONNECT
             
-            // PHASE 4: Scan-based approaches
+            // PHASE 5: Scan-based approaches
             ConnectionStep.SCAN_AND_CONNECT -> ConnectionStep.REFRESH_CACHE
             ConnectionStep.REFRESH_CACHE -> ConnectionStep.BACKGROUND_CONNECT
             ConnectionStep.BACKGROUND_CONNECT -> {
-                // After background connect fails, try rebond if not attempted
                 if (!rebondAttempted) ConnectionStep.FORCE_REBOND
                 else if (shouldTryBlindWrite) ConnectionStep.BLIND_WRITE_ATTEMPT
                 else ConnectionStep.NUCLEAR_BLUETOOTH_RESET
             }
             
-            // PHASE 5: Bonding operations
+            // PHASE 6: Bonding operations
             ConnectionStep.FORCE_REBOND -> ConnectionStep.WAIT_FOR_REBOND
             ConnectionStep.WAIT_FOR_REBOND -> ConnectionStep.POST_REBOND_CONNECT
             ConnectionStep.POST_REBOND_CONNECT -> {
@@ -397,7 +445,7 @@ class Z407Manager(
                 else ConnectionStep.NUCLEAR_BLUETOOTH_RESET
             }
             
-            // PHASE 6: Last resort
+            // PHASE 7: Last resort
             ConnectionStep.BLIND_WRITE_ATTEMPT -> {
                 if (!nuclearResetAttempted) ConnectionStep.NUCLEAR_BLUETOOTH_RESET
                 else ConnectionStep.FINAL_DIRECT_CONNECT
@@ -425,28 +473,33 @@ class Z407Manager(
             ConnectionStep.EXTENDED_WAIT_AFTER_DISCONNECT -> extendedWaitAfterDisconnect("Phase 1b: Extended Wait (5s)")
             
             // PHASE 2
-            ConnectionStep.DIRECT_CONNECT_AUTO -> connectInternal(false, "Phase 2: Direct (Auto)", FAST_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_AUTO)
-            ConnectionStep.GATT_BOUNCE_AGGRESSIVE -> performAggressiveGattBounce("Phase 2b: Aggressive GATT Bounce")
-            ConnectionStep.DIRECT_CONNECT_LE -> connectInternal(false, "Phase 2c: Direct (LE)", FAST_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_LE)
+            ConnectionStep.DIRECT_CONNECT_BREDR -> connectInternal(false, "Phase 2: Direct (BR/EDR)", FAST_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_BREDR)
+            ConnectionStep.MTU_NEGOTIATE_CONNECT -> attemptMtuNegotiateConnect("Phase 2b: MTU Negotiate")
+            ConnectionStep.DIRECT_CONNECT_AUTO -> connectInternal(false, "Phase 2c: Direct (Auto)", FAST_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_AUTO)
+            ConnectionStep.GATT_BOUNCE_AGGRESSIVE -> performAggressiveGattBounce("Phase 2d: Aggressive GATT Bounce")
+            ConnectionStep.DIRECT_CONNECT_LE -> connectInternal(false, "Phase 2e: Direct (LE)", FAST_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_LE)
             
             // PHASE 3
-            ConnectionStep.EXTENDED_WAIT_DISCOVERY -> attemptExtendedWaitDiscovery("Phase 3: Extended Wait Discovery")
-            ConnectionStep.AGGRESSIVE_DISCOVERY -> attemptAggressiveDiscovery("Phase 3b: Aggressive Discovery")
+            ConnectionStep.CLASSIC_SOCKET_PROBE -> attemptClassicSocketProbe("Phase 3: Classic Socket Probe")
             
             // PHASE 4
-            ConnectionStep.SCAN_AND_CONNECT -> startScanInternal("Phase 4: Scan & Connect")
-            ConnectionStep.REFRESH_CACHE -> refreshCacheAndReconnect("Phase 4b: Cache Refresh")
-            ConnectionStep.BACKGROUND_CONNECT -> connectInternal(true, "Phase 4c: Background (Wait)", BACKGROUND_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_LE)
+            ConnectionStep.EXTENDED_WAIT_DISCOVERY -> attemptExtendedWaitDiscovery("Phase 4: Extended Wait Discovery")
+            ConnectionStep.AGGRESSIVE_DISCOVERY -> attemptAggressiveDiscovery("Phase 4b: Aggressive Discovery")
             
             // PHASE 5
-            ConnectionStep.FORCE_REBOND -> forceUnpairAndRebond("Phase 5: Force Re-Bond")
-            ConnectionStep.WAIT_FOR_REBOND -> waitForRebondCompletion("Phase 5b: Waiting for Bond...")
-            ConnectionStep.POST_REBOND_CONNECT -> connectInternal(false, "Phase 5c: Post-Rebond Connect", EXTENDED_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_AUTO)
+            ConnectionStep.SCAN_AND_CONNECT -> startScanInternal("Phase 5: Scan & Connect")
+            ConnectionStep.REFRESH_CACHE -> refreshCacheAndReconnect("Phase 5b: Cache Refresh")
+            ConnectionStep.BACKGROUND_CONNECT -> connectInternal(true, "Phase 5c: Background (Wait)", BACKGROUND_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_LE)
             
             // PHASE 6
-            ConnectionStep.BLIND_WRITE_ATTEMPT -> attemptBlindWrite("Phase 6: Blind Write")
-            ConnectionStep.NUCLEAR_BLUETOOTH_RESET -> performNuclearBluetoothReset("Phase 6b: NUCLEAR Bluetooth Reset")
-            ConnectionStep.FINAL_DIRECT_CONNECT -> connectInternal(false, "Phase 6c: FINAL Last Resort", EXTENDED_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_AUTO)
+            ConnectionStep.FORCE_REBOND -> forceUnpairAndRebond("Phase 6: Force Re-Bond")
+            ConnectionStep.WAIT_FOR_REBOND -> waitForRebondCompletion("Phase 6b: Waiting for Bond...")
+            ConnectionStep.POST_REBOND_CONNECT -> connectInternal(false, "Phase 6c: Post-Rebond Connect", EXTENDED_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_AUTO)
+            
+            // PHASE 7
+            ConnectionStep.BLIND_WRITE_ATTEMPT -> attemptBlindWrite("Phase 7: Blind Write")
+            ConnectionStep.NUCLEAR_BLUETOOTH_RESET -> performNuclearBluetoothReset("Phase 7b: NUCLEAR Bluetooth Reset")
+            ConnectionStep.FINAL_DIRECT_CONNECT -> connectInternal(false, "Phase 7c: FINAL Last Resort", EXTENDED_CONNECTION_TIMEOUT, BluetoothDevice.TRANSPORT_AUTO)
             
             else -> { /* FAILED case */ }
         }
@@ -557,6 +610,174 @@ class Z407Manager(
             log(Log.INFO, "Extended wait complete. Proceeding to connection attempts.")
             tryNextConnectionStep()
         }, 5000)
+    }
+    
+    /**
+     * STRATEGY: MTU NEGOTIATE CONNECT
+     * Connect and request maximum MTU BEFORE attempting service discovery.
+     * This can force the BLE stack to do a proper negotiation which sometimes "wakes up" the GATT server.
+     */
+    private fun attemptMtuNegotiateConnect(feedback: String) {
+        runOnUiThread { updateCommandFeedback(feedback) }
+        log(Log.INFO, "=== MTU NEGOTIATE STRATEGY ===")
+        log(Log.INFO, "Will request MTU before discovery to force negotiation...")
+        
+        if (targetDevice == null) {
+            log(Log.ERROR, "Target device is null.")
+            tryNextConnectionStep()
+            return
+        }
+        
+        val mtuCallback = object : BluetoothGattCallback() {
+            override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+                log(Log.INFO, "[MTU] Connection state: ${gattStatusToString(status)}, newState=$newState")
+                
+                if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
+                    trackGatt(gatt)
+                    bluetoothGatt = gatt
+                    log(Log.INFO, "[MTU] Connected. Requesting maximum MTU (517)...")
+                    
+                    // Request max MTU first
+                    val mtuResult = gatt.requestMtu(517)
+                    log(Log.INFO, "[MTU] requestMtu() returned: $mtuResult")
+                    
+                    if (!mtuResult) {
+                        log(Log.WARN, "[MTU] requestMtu failed immediately. Trying discovery anyway...")
+                        refreshGattCache(gatt)
+                        handler.postDelayed({ gatt.discoverServices() }, 2000)
+                    }
+                    
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    gatt.close()
+                    if (bluetoothGatt === gatt) bluetoothGatt = null
+                    log(Log.INFO, "[MTU] Disconnected. Proceeding to next strategy.")
+                    tryNextConnectionStep()
+                }
+            }
+            
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                log(Log.INFO, "[MTU] MTU changed to $mtu (status: ${gattStatusToString(status)})")
+                
+                // Now refresh cache and discover
+                refreshGattCache(gatt)
+                handler.postDelayed({
+                    log(Log.INFO, "[MTU] Now calling discoverServices after MTU negotiation...")
+                    gatt.discoverServices()
+                }, 2500)
+            }
+            
+            override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                val services = gatt.services
+                log(Log.INFO, "[MTU] Discovered ${services.size} services after MTU negotiation")
+                
+                if (services.isNotEmpty()) {
+                    val cmdChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(COMMAND_UUID)
+                    val respChar = gatt.getService(SERVICE_UUID)?.getCharacteristic(RESPONSE_UUID)
+                    
+                    if (cmdChar != null && respChar != null) {
+                        log(Log.INFO, "[MTU] SUCCESS! Found Z407 characteristics!")
+                        watchdogHandler.removeCallbacksAndMessages(null)
+                        commandCharacteristic = cmdChar
+                        currentStep = ConnectionStep.CONNECTED
+                        setupNotificationsAndHandshake(gatt, respChar)
+                        return
+                    }
+                }
+                
+                log(Log.WARN, "[MTU] No valid services found. Disconnecting.")
+                gatt.disconnect()
+            }
+            
+            override fun onDescriptorWrite(gatt: BluetoothGatt?, descriptor: BluetoothGattDescriptor?, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    log(Log.INFO, "[MTU] Descriptor written!")
+                    handler.postDelayed({ sendCommand(Commands.HANDSHAKE, "Handshake") }, 100)
+                }
+            }
+            
+            override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
+                handleResponse(value)
+            }
+        }
+        
+        watchdogHandler.postDelayed({
+            if (currentStep == ConnectionStep.MTU_NEGOTIATE_CONNECT) {
+                log(Log.WARN, "[MTU] Timeout. Disconnecting and moving on.")
+                bluetoothGatt?.disconnect()
+                bluetoothGatt?.close()
+                bluetoothGatt = null
+                tryNextConnectionStep()
+            }
+        }, FAST_CONNECTION_TIMEOUT)
+        
+        try {
+            val gatt = targetDevice!!.connectGatt(context, false, mtuCallback, BluetoothDevice.TRANSPORT_AUTO)
+            if (gatt != null) trackGatt(gatt)
+        } catch (e: Exception) {
+            log(Log.ERROR, "[MTU] Exception: ${e.message}")
+            tryNextConnectionStep()
+        }
+    }
+    
+    /**
+     * STRATEGY: CLASSIC SOCKET PROBE
+     * Try to connect via classic Bluetooth RFCOMM socket.
+     * Some hybrid devices (like Z407 which is BR/EDR + LE) may need this to "wake up" their GATT server.
+     * The theory is that a classic socket creates a different code path in the speaker's firmware.
+     */
+    private fun attemptClassicSocketProbe(feedback: String) {
+        runOnUiThread { updateCommandFeedback(feedback) }
+        log(Log.INFO, "=== CLASSIC SOCKET PROBE STRATEGY ===")
+        log(Log.INFO, "Attempting RFCOMM connection to potentially wake up GATT server...")
+        
+        if (targetDevice == null) {
+            log(Log.ERROR, "Target device is null.")
+            tryNextConnectionStep()
+            return
+        }
+        
+        classicSocketProbed = true
+        
+        // Run in background thread to avoid blocking
+        Thread {
+            var socket: BluetoothSocket? = null
+            try {
+                // Try SPP UUID first (common for audio devices)
+                val sppUuid = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+                
+                log(Log.INFO, "[ClassicSocket] Creating RFCOMM socket with SPP UUID...")
+                socket = targetDevice!!.createRfcommSocketToServiceRecord(sppUuid)
+                
+                log(Log.INFO, "[ClassicSocket] Attempting connect (may take a few seconds)...")
+                socket.connect()
+                
+                log(Log.INFO, "[ClassicSocket] Connected! This might have woken up the GATT server.")
+                
+                // Brief pause then disconnect
+                Thread.sleep(1000)
+                
+                socket.close()
+                log(Log.INFO, "[ClassicSocket] Socket closed. Now trying GATT connection...")
+                
+            } catch (e: Exception) {
+                log(Log.INFO, "[ClassicSocket] Socket connection failed (expected for GATT-only devices): ${e.message}")
+                // This is often expected - the point is just to "poke" the device
+                try { socket?.close() } catch (ex: Exception) {}
+            }
+            
+            // Continue to next strategy on main thread
+            handler.postDelayed({
+                tryNextConnectionStep()
+            }, 1000)
+        }.start()
+        
+        // Timeout
+        watchdogHandler.postDelayed({
+            if (currentStep == ConnectionStep.CLASSIC_SOCKET_PROBE) {
+                log(Log.WARN, "[ClassicSocket] Timeout. Proceeding.")
+                tryNextConnectionStep()
+            }
+        }, 15000)
     }
     
     /**
