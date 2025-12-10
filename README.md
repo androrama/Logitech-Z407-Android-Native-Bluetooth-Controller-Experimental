@@ -52,3 +52,37 @@ The core logic resides in `Z407Manager.kt`. We are looking for solutions to reli
 ## 📄 License
 
 This project is for educational and research purposes.
+
+## Technical Report: Tested Methods & Conclusions
+
+During the development of this application (up to version 1.4), extensive reverse engineering and connection strategies were employed to attempt to communicate with the Logitech Z407 GATT server on Android. Below is a comprehensive list of methods tested, all of which resulted in a successful Link Layer connection but failed Service Discovery (0 services found):
+
+### 1. Transport Layer Variations
+*   **TRANSPORT_LE**: Forcing Low Energy transport. Result: Consistently fails with GATT_ERROR (133) or Timeouts.
+*   **TRANSPORT_BREDR**: Forcing Classic/BR-EDR transport. Result: Connects, but exposes no GATT services.
+*   **TRANSPORT_AUTO**: Default Android behavior. Result: Connects, mixed stability, no services found.
+
+### 2. Connection Timing & Sequence
+*   **Standard Discovery**: Connection immediately followed by `discoverServices()`.
+*   **Extended Waits**: Delays of 2s, 5s, and 10s between connection and discovery to allow firmware initialization.
+*   **GATT Bounce**: Rapid cycles (3x to 5x) of connection/disconnection to clear internal device caches.
+*   **Aggressive Retries**: Up to 7 retries of service discovery with incremental backoff delays.
+
+### 3. Cache & Profile Management
+*   **Hidden Refresh API**: Accessing internal `refresh()` method on BluetoothGatt via reflection.
+*   **Profile Disconnection**: Programmatic disconnection of A2DP, HEADSET (HFP), and AVRCP profiles via Proxy APIs before attempting GATT connection to avoid resource conflicts.
+*   **Unpair/Rebond**: Programmatic removal of bond (unpair) and forced re-bonding flow.
+*   **Adapter Reset**: Toggling the system Bluetooth Adapter OFF and ON (Nuclear Reset).
+
+### 4. Advanced/Hybrid Probing (v1.3+)
+*   **MTU Negotiation**: Requesting MTU 517 immediately upon connection to force a specific negotiation packet flow.
+*   **Classic Socket Probe**: Opening an SPP (Serial Port Profile) RFCOMM socket to the device to "wake up" the main CPU before switching to GATT.
+*   **Dual Mode Probe**: Explicitly invoking `fetchUuidsWithSdp()` followed by an insecure RFCOMM connection attempt to trigger hybrid stack behavior.
+*   **Blind Write**: Attempting to write directly to known Characteristic Handles without service discovery (Android API restricts this significantly compared to Linux/BlueZ).
+
+### 5. Connection Initiation Variants
+*   **Background Connection**: Using `autoConnect=true` to allow the Android stack to manage the connection timing and scheduling (seen in logs as timeouts).
+*   **Scan-First Flow**: Forcing a successful BLE Advertisement Scan (`startScan`) before attempting any connection to ensure radio presence.
+
+### Conclusion
+The Logitech Z407 appears to implement a restrictive Bluetooth stack that strictly separates Classic Audio from BLE Control. While Linux (BlueZ) and Windows stacks can successfully negotiate this hybrid state, the Android Bluetooth stack's abstraction layer fails to retrieve the GATT Service Table (0000fdc2...) once the device is paired for Audio. This suggests the device may require a specific Link Key exchange or L2CAP channel configuration that Android does not perform by default for this class of device. Future work would require rooting the device to capture lower-level HCI logs or using an external BLE sniffer to compare the Android handshake vs. the Windows handshake.
