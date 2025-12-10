@@ -1,15 +1,28 @@
-# Logitech Z407 Android Controller (Experimental)
+# Logitech Z407 Android Native Bluetooth Controller (Experimental)
 
-An advanced Android application designed to control Logitech Z407 Bluetooth speakers directly from your smartphone, bypassing the need for the physical puck dial. 
+<p align="center">
+  <img src="app_screenshot.jpg" alt="App Screenshot" width="300" />
+</p>
+
+An advanced Android application designed to control Logitech Z407 Bluetooth speakers directly using **Android's native Bluetooth stack**. This allows for portable control directly from your phone, distinguishing it from desktop-based solutions.
 
 > **⚠️ CURRENT STATUS: WORK IN PROGRESS**  
-> This application is currently in active development. Despite implementing aggressive connection strategies, **it currently struggles to establish a stable GATT connection with the Z407 speakers** due to the device's restrictive Bluetooth stack behavior. It serves as a proof-of-concept and a base for further reverse-engineering.
+> This application is currently in active development. Despite implementing aggressive connection strategies, **it currently struggles to establish a stable GATT connection with the Z407 speakers** due to the device's restrictive Bluetooth stack behavior on Android. It serves as a proof-of-concept and a base for further reverse-engineering.
 
-![App Screenshot](app_screenshot.jpg)
+## ✅ Working Alternatives (Desktop)
+
+If you are looking for a **fully functional** remote control solution right now and valid connection cannot be established with this Android app, I have developed stable Web App controllers for desktop platforms that **work perfectly**:
+
+*   🖥️ **Windows Version**: [Logitech Z407 Remote Control Web App - Windows](https://github.com/androrama/Logitech-Z407-Remote-Control-Web-App---Windows)
+*   🐧 **Linux Version**: [Logitech Z407 Remote Control Web App - Linux](https://github.com/androrama/Logitech-Z407-Remote-Control-Web-App---Linux)
+
+These PC versions successfully overcome the connection hurdles that are currently being researched in this Android project.
+
+---
 
 ## 📌 Project Overview
 
-The Logitech Z407 speakers use a proprietary BLE (Bluetooth Low Energy) protocol for their wireless control dial. This app attempts to reverse-engineer and emulate that protocol to allow volume control, bass adjustment, and input switching from an Android device.
+The Logitech Z407 speakers use a proprietary BLE (Bluetooth Low Energy) protocol for their wireless control dial. This app attempts to reverse-engineer and emulate that protocol to allow volume control, bass adjustment, and input switching from an Android device via **standard Android Bluetooth**.
 
 The main challenge is that the Z407 speakers do not easily expose their GATT services (needed for control commands) when they are already connected via standard Bluetooth Audio (A2DP). This project implements a sophisticated connection manager (`Z407Manager`) to overcome these limitations.
 
